@@ -2,10 +2,11 @@
 
 import os
 import sys
+import signal
 
 
 def builtin_echo(args):
-    print("".join(args))
+    print(" ".join(args))
 
 
 def builtin_exit(args):
@@ -19,7 +20,6 @@ BUILTIN_COMMAND_FUNC_MAPPING = {
 
 
 def find_command(command):
-
     if "/" in command:
         if os.path.exists(command):
             return command
@@ -32,34 +32,116 @@ def find_command(command):
     return None
 
 
-def main():
-    while True:
-        line = input("> ")
-        tokens = line.split()
+def set_stdio(stdin_fd=None, stdout_fd=None):
+    if stdin_fd is not None:
+        os.dup2(stdin_fd, sys.stdin.fileno())
 
-        if len(tokens) == 0:
-            continue
+    if stdout_fd is not None:
+        os.dup2(stdout_fd, sys.stdout.fileno())
 
-        command = tokens[0]
-        args = tokens[1:]
 
-        if command in BUILTIN_COMMAND_FUNC_MAPPING:
-            func = BUILTIN_COMMAND_FUNC_MAPPING[command]
-            func(args)
+def run_command(tokens, stdin_fd=None, stdout_fd=None):
+    command = tokens[0]
+    args = tokens[1:]
+
+    if command in BUILTIN_COMMAND_FUNC_MAPPING:
+        default_stdin_dup_fd = os.dup(sys.stdin.fileno())
+        default_stdout_dup_fd = os.dup(sys.stdout.fileno())
+        set_stdio(stdin_fd, stdout_fd)
+
+        func = BUILTIN_COMMAND_FUNC_MAPPING[command]
+        func(args)
+
+        set_stdio(default_stdin_dup_fd, default_stdout_dup_fd)
+        os.close(default_stdin_dup_fd)
+        os.close(default_stdout_dup_fd)
+    else:
+        command_path = find_command(command)
+
+        if command_path is None:
+            print(f"{command}: command not found", file=sys.stderr)
+            return
+
+        pid = os.fork()
+
+        if pid == 0:
+            set_stdio(stdin_fd, stdout_fd)
+
+            command_basename = os.path.basename(command_path)
+            os.execve(command_path, [command_basename] + args, os.environ)
         else:
-            command_path = find_command(command)
+            os.waitpid(pid, 0)
 
-            if command_path is None:
-                print(f"{command}: command not found", file=sys.stderr)
-                continue
 
-            pid = os.fork()
+def interpret_line(line):
+    if line.strip().startswith("#"):  # から始まる行は何もしない
+        return
 
-            if pid == 0:
-                command_basename = os.path.basename(command_path)
-                os.execve(command_path, [command_basename] + args, os.environ)
-            else:
-                os.waitpid(pid, 0)
+    tokens = line.split()
+
+    if len(tokens) == 0:
+        return
+
+    redirection_count = tokens.count(">")
+    pipe_count = tokens.count("|")
+
+    #リダイレクトの実装
+    if redirection_count + pipe_count >= 2:
+        print("More than 2 redirections or pipes are not suppoeted", file=sys.stderr)
+        return
+
+    if redirection_count == 1:
+        redirection_index = tokens.index(">")
+        command_and_args = tokens[:redirection_index]
+        stdout_file_name = tokens[redirection_index + 1]
+
+        stdout_file = open(stdout_file_name, "w")
+        stdout_fd = stdout_file.fileno()
+
+        run_command(command_and_args, stdin_fd=stdout_fd)
+
+        os.close(stdout_fd)
+
+    elif pipe_count == 1:
+        pipe_index = tokens.index("|")
+        command_and_args1 = tokens[:pipe_index]
+        command_and_args2 = tokens[pipe_index + 1:]
+
+        pipe_r, pipe_w = os.pipe()
+
+        # 本来は並列実行するが、簡易的に順次実行
+        run_command(command_and_args1, stdout_fd=pipe_w)
+        os.close(pipe_w)
+        run_command(command_and_args2, stdin_fd=pipe_r)
+        os.close(pipe_r)
+
+    else:
+        run_command(tokens)
+
+
+def sigint_handler(signum, frame):
+    pass  # ctrl+C(SIGINT)を無視する
+
+
+def main():
+    if len(sys.argv) >= 2:
+        # 引数にファイル名が与えられていたら、そのファイル内のコマンドをバッチモードで実行
+        file_name = sys.argv[1]
+    else:
+        file_name = None
+
+    if file_name is None:  # 引数(file_name)がなければ対話型モードになる（引数を受け取る）
+
+        signal.signal(signal.SIGINT, sigint_handler)
+
+        while True:
+            line = input("> ")
+            interpret_line(line)
+
+    else:
+        with open(file_name) as f:
+            for line in f:
+                interpret_line(line)
 
 
 if __name__ == '__main__':

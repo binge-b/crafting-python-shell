@@ -1,0 +1,4 @@
+#!./pyminish
+
+echo hello
+ls
